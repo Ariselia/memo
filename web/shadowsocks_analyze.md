@@ -162,8 +162,8 @@ remote -> ss -> client
 * shell.py：读取命令行参数，检查配置；
 * common.py：提供一些工具函数，比如：将 bytes 转换成 str、解析 SOCKS5 请求；
 * lru_cache.py：实现了 LRU 缓存；
-* local.py：shadowsocks 客户端（即 sslocal 命令）的入口；
-* server.py：shadowsocks 服务器（即 ssserver 命令）的入口。
+* local.py：shadowsocks 客户端（即 ss-local 命令）的入口；
+* server.py：shadowsocks 服务器（即 ss-server 命令）的入口。
 
 
 
