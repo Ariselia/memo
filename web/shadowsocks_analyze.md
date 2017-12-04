@@ -162,8 +162,225 @@ remote -> ss -> client
 * shell.py：读取命令行参数，检查配置；
 * common.py：提供一些工具函数，比如：将 bytes 转换成 str、解析 SOCKS5 请求；
 * lru_cache.py：实现了 LRU 缓存；
-* local.py：shadowsocks 客户端（即 ss-local 命令）的入口；
-* server.py：shadowsocks 服务器（即 ss-server 命令）的入口。
+* local.py：shadowsocks 客户端（即 sslocal 命令）的入口；
+* server.py：shadowsocks 服务器（即 ssserver 命令）的入口。
+
+
+sslocal 和 ssserver 复用了绝大部分的代码，所以两者的运行流程都可以用伪代码表示为：
+
+```
+# local.py or server.py
+def main():
+    # 解析命令行和配置文件中的参数
+    conf = shell.parse_config()
+    # 根据配置决定要不要以守护进程的方式运行
+    daemon.daemonize(conf)
+
+    loop = eventloop.init()
+    tcp_server = tcprelay.init(conf)
+    udp_server = udprelay.init(conf)
+    dns_resolver = asyncdns.init(conf)
+
+    # 将 TCPRelay、UDPRelay 和 DNSResolver 注册到事件循环中
+    tcp_server.add_to_loop(loop)
+    udp_server.add_to_loop(loop)
+    dns_resolver.add_to_loop(loop)
+
+    loop.run()
+
+# eventloop.py 中 loop.run 的实现
+def loop_run():
+    while True:
+        events = wait_for_events()
+        for handler, event in events:
+            # handler 是 TCPRelay、UDPRelay 或 DNSResolver
+            handler.handle_event(event)
+```
+
+有一点需要提一下：**代理和能翻墙的代理是不一样的。**比如，下图是普通的 SOCKS5 代理： 
+
+
+
+![normal-proxy.svg](./normal-proxy.svg)
+
+
+
+ 而能翻墙的 SOCKS5 代理是下图这种结构：
+
+
+
+ ![ss-proxy.svg](./ss-proxy.svg)    
+
+
+
+ 可以看出来，SOCKS5 服务器的实现被拆分成了两部分：
+
+
+* sslocal 负责与 SOCKS5 客户端进行 SOCKS5 协议相关的通讯（握手并建立连接），在建立连接后将 SOCKS5 客户端发来的数据加密并发送给 ssserver；
+* ssserver 起到一个中继的作用，负责解密以后将数据转发给目标服务器，并不涉及 
+SOCKS5 协议的任何一部分
+
+
+其中一个重要的环节就是加密解密——数据经过 sslocal（本机）加密以后转发给 ssserver（VPS），这也是普通代理和能翻墙的代理的区别。在了解到这一点以后，shadowsocks 的很多细节就容易理解了。下面我们分模块，对 shadowsocks 内部结构一探究竟。
+
+
+## 事件处理
+
+
+Shadowsocks 封装了三种常见的 IO 复用函数——`epoll`, `kqueue` 和 `select`，并通过 eventloop.py 提供统一的接口。之所以使用 IO 复用，而不是多线程的方式，是因为前者能提供更好的性能和更少的内存开销，这在路由器上至关重要。
+
+### eventloop.py
+
+
+`eventloop.py` 的主要逻辑在于 `run` 函数的实现：
+
+
+```
+def run(self):
+    events = []
+    while not self._stopping:
+        # as soon as possible
+        asap = False
+        # 获取事件
+        try:
+            events = self.poll(TIMEOUT_PRECISION)
+        except (OSError, IOError) as e:
+            if errno_from_exception(e) in (errno.EPIPE, errno.EINTR):
+                # EPIPE: Happens when the client closes the connection
+                # EINTR: Happens when received a signal
+                # handles them as soon as possible
+                asap = True
+                logging.debug('poll:%s', e)
+            else:
+                logging.error('poll:%s', e)
+                import traceback
+                traceback.print_exc()
+                continue
+        # 找到事件对应的 handler，将事件交由它处理
+        for sock, fd, event in events:
+            # 通过 fd 找到对应的 handler
+            # 一个 handler 可能对应多个 fd（reactor 模式）
+            handler = self._fdmap.get(fd, None)
+            if handler is not None:
+                handler = handler[1]
+                try:
+                    # handler 可能是 TCPRelay、UDPRelay 或 DNSResolver
+                    handler.handle_event(sock, fd, event)
+                except (OSError, IOError) as e:
+                    shell.print_exception(e)
+        # 计时器。每隔 10s 调用注册的 handle_periodic 函数
+        now = time.time()
+        if asap or now - self._last_time >= TIMEOUT_PRECISION:
+            for callback in self._periodic_callbacks:
+                callback()
+            self._last_time = now
+```
+
+
+ ### tcprelay.py
+
+
+Shadowsocks 采用了反应器模式（[reactor pattern](https://en.wikipedia.org/wiki/Reactor_pattern)），如下图所示。
+
+
+
+![ss-reactor-pattern.png](./ss-reactor-pattern.png)
+
+
+
+`TCPRelayHandler` 的事件会由 `EventLoop` 分发给 `TCPRelay`，再经由 `TCPRelay` 将事件分发给相应的 `TCPRelayHandler` 处理。这个过程发生在 `EventLoop` 和 `TCPRelay` 的 `handle_event` 函数。
+
+
+我们去掉其中的日志处理和错误处理逻辑，看看 `handle_event` 函数：
+
+
+```
+def handle_event(self, sock, fd, event):
+    # 如果是 TCPRelay 的 socket
+    if sock == self._server_socket:
+        conn = self._server_socket.accept()
+        TCPRelayHandler(self, self._fd_to_handlers,
+                        self._eventloop, conn[0], self._config,
+                        self._dns_resolver, self._is_local)
+    else:
+        # 找到 fd 对应的 TCPRelayHandler
+        handler = self._fd_to_handlers.get(fd, None)
+        if handler:
+            handler.handle_event(sock, event)
+```
+
+
+逻辑很简单，如果发生事件（可读事件）的 `socket` 是 `TCPRelay` 的 `socket`，说明有新的 `TCP` 连接，创建一个 `TCPRelayHandler` 对象将新连接封装起来。否则，找到发生事件的 `TCPRelayHandler`，将事件交给它处理。            
+
+
+### udprelay.py
+
+
+`UDPRelay` 的 `handle_event` 类似，不过它没有什么 `UDPRelayHandler`, 所有的逻辑都是 `UDPRelay` 处理的，只不过不同的 `socket` 对应不同的函数——`_handle_server `和 `_handle_client`. 
+
+
+```
+# 只有可读事件，所以不需要传入 event 给 `_handle_server` 或 `_handle_client`
+def handle_event(self, sock, fd, event):
+    if sock == self._server_socket:
+        # 如果有错误发生，记录日志
+        if event & eventloop.POLL_ERR:
+            logging.error('UDP server_socket err')
+        self._handle_server()
+    elif sock and (fd in self._sockets):
+        if event & eventloop.POLL_ERR:
+            logging.error('UDP client_socket err')
+        # 需要告诉是哪个 sock 发生了事件
+        self._handle_client(sock)
+```
+
+
+### asyncdns.py
+
+
+`DNSResolver` 的 `handle_event` 与 `TCPRelay` 和 `UDPRelay` 都不一样，因为它不需要分发处理，所以逻辑更简单：
+
+
+```
+# 只有可读事件
+def handle_event(self, sock, fd, event):
+    # 防御性编程，实际上是个无用的判断
+    if sock != self._sock:
+        return
+    # 如果有错误事件发生
+    if event & eventloop.POLL_ERR:
+        logging.error('dns socket err')
+        # 从事件循环移除 self._sock
+        self._loop.remove(self._sock)
+        self._sock.close()
+        # 重新初始化 self._sock
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                   socket.SOL_UDP)
+        # 将套接字设置为非阻塞模式
+        self._sock.setblocking(False)
+        # 重新注册到事件循环
+        self._loop.add(self._sock, eventloop.POLL_IN, self)
+    else:
+        # 读取一个 UDP 包，并取出前 1024 个字节
+        # 注意：如果一个 UDP 包超过 1024 字节，比如：2048 字节。
+        # 一次 recvfrom(1024) 也会消耗整个 UDP 包。这里是认为
+        # DNS 查询返回的 UDP 包都不会超过 1024 字节。
+        data, addr = sock.recvfrom(1024)
+        if addr[0] not in self._servers:
+            logging.warn('received a packet other than our dns')
+            return
+        self._handle_data(data)
+```
+
+
+# END.
+
+
+
+
+
+
+
 
 
 
